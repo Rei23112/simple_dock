@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -11,9 +14,17 @@ class SimpleDockApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
     title: 'Simple Dock',
+    locale: const Locale('ja', 'JP'),
+    supportedLocales: const [Locale('ja', 'JP')],
+    localizationsDelegates: const [
+      GlobalMaterialLocalizations.delegate,
+      GlobalCupertinoLocalizations.delegate,
+      GlobalWidgetsLocalizations.delegate,
+    ],
     theme: ThemeData(
       colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xfff05d5e)),
       useMaterial3: true,
+      fontFamily: 'sans-serif',
     ),
     home: const DockHomePage(),
   );
@@ -33,12 +44,18 @@ class _DockHomePageState extends State<DockHomePage>
   bool _overlayEnabled = false;
   bool _hideOnLaunch = true;
   bool _hideAfterDelay = false;
+  bool _hideOnKeyboard = true;
   bool _followRotation = true;
+  bool _usageAccess = false;
+  bool _batteryOptimizationExempt = false;
   double _iconSize = 56;
   double _opacity = .92;
+  double _showPosition = 50;
   int _recentCount = 5;
   String _orientation = 'bottom';
-  String _iconShape = 'circle';
+  String _iconShape = 'round';
+  bool _permissionDialogVisible = false;
+  Timer? _settingsTimer;
 
   @override
   void initState() {
@@ -49,8 +66,16 @@ class _DockHomePageState extends State<DockHomePage>
 
   @override
   void dispose() {
+    _settingsTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _load();
+    }
   }
 
   @override
@@ -58,9 +83,9 @@ class _DockHomePageState extends State<DockHomePage>
     final views = WidgetsBinding.instance.platformDispatcher.views;
     if (views.isEmpty) return;
     final bottomInset = views.first.viewInsets.bottom;
-    if (bottomInset > 0) {
+    if (bottomInset > 0 && _hideOnKeyboard) {
       _channel.invokeMethod('collapseDock');
-    } else {
+    } else if (bottomInset == 0) {
       _channel.invokeMethod('refreshDock');
     }
   }
@@ -78,18 +103,95 @@ class _DockHomePageState extends State<DockHomePage>
       _overlayEnabled = prefs.getBool('overlayEnabled') ?? false;
       _hideOnLaunch = prefs.getBool('hideOnLaunch') ?? true;
       _hideAfterDelay = prefs.getBool('hideAfterDelay') ?? false;
+      _hideOnKeyboard = prefs.getBool('hideOnKeyboard') ?? true;
       _followRotation = prefs.getBool('followRotation') ?? true;
       _iconSize = prefs.getDouble('iconSize') ?? 56;
       _opacity = prefs.getDouble('opacity') ?? .92;
-      _recentCount = prefs.getInt('recentCount') ?? 5;
+      _showPosition = prefs.getDouble('showPosition') ?? 50;
+      _recentCount = (prefs.getInt('recentCount') ?? 5).clamp(1, 8);
       _orientation = prefs.getString('orientation') ?? 'bottom';
-      _iconShape = prefs.getString('iconShape') ?? 'circle';
+      final storedShape = prefs.getString('iconShape') ?? 'round';
+      _iconShape = storedShape == 'circle' ? 'round' : storedShape;
     });
     final allowed =
         await _channel.invokeMethod<bool>('hasOverlayPermission') ?? false;
-    if (prefs.getBool('overlayEnabled') == true && allowed) {
+    await _checkUsageAccess();
+    await _checkBatteryOptimization();
+    if (prefs.getBool('overlayEnabled') == true && !allowed) {
+      _showPermissionDialog(
+        title: '表示権限が必要です',
+        message: '他のアプリの上に dock を表示するため、表示権限を許可してください。',
+        actionLabel: '表示権限を設定',
+        action: () async {
+          await _channel.invokeMethod('openOverlaySettings');
+        },
+      );
+    } else if (prefs.getBool('overlayEnabled') == true && allowed) {
       await _channel.invokeMethod('startDock');
+      if (_hideOnLaunch && !_usageAccess) {
+        _showPermissionDialog(
+          title: '使用状況へのアクセスが必要です',
+          message: '外部アプリの起動検知と recent の更新に使用します。',
+          actionLabel: '使用状況を設定',
+          action: _openUsageAccessSettings,
+        );
+      }
     }
+  }
+
+  void _showPermissionDialog({
+    required String title,
+    required String message,
+    required String actionLabel,
+    required Future<void> Function() action,
+  }) {
+    if (!mounted || _permissionDialogVisible) return;
+    _permissionDialogVisible = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('あとで'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                Navigator.of(context).pop();
+                await action();
+              },
+              child: Text(actionLabel),
+            ),
+          ],
+        ),
+      );
+      _permissionDialogVisible = false;
+    });
+  }
+
+  Future<void> _checkUsageAccess() async {
+    final granted =
+        await _channel.invokeMethod<bool>('hasUsageAccess') ?? false;
+    if (mounted) setState(() => _usageAccess = granted);
+  }
+
+  Future<void> _openUsageAccessSettings() async {
+    await _channel.invokeMethod('openUsageAccessSettings');
+  }
+
+  Future<void> _checkBatteryOptimization() async {
+    final exempt =
+        await _channel.invokeMethod<bool>('hasBatteryOptimizationExemption') ??
+        false;
+    if (mounted) setState(() => _batteryOptimizationExempt = exempt);
+  }
+
+  Future<void> _openBatterySettings() async {
+    await _channel.invokeMethod('openBatterySettings');
   }
 
   Future<void> _set(String key, Object value) async {
@@ -98,21 +200,26 @@ class _DockHomePageState extends State<DockHomePage>
     if (value is int) await prefs.setInt(key, value);
     if (value is double) await prefs.setDouble(key, value);
     if (value is String) await prefs.setString(key, value);
-    await _channel.invokeMethod('updateSettings', {
-      'hideOnLaunch': _hideOnLaunch,
-      'hideAfterDelay': _hideAfterDelay,
-      'followRotation': _followRotation,
-      'iconSize': _iconSize,
-      'opacity': _opacity,
-      'recentCount': _recentCount,
-      'orientation': _orientation,
-      'iconShape': _iconShape,
+    _settingsTimer?.cancel();
+    _settingsTimer = Timer(const Duration(milliseconds: 140), () async {
+      await _channel.invokeMethod('updateSettings', {
+        'hideOnLaunch': _hideOnLaunch,
+        'hideAfterDelay': _hideAfterDelay,
+        'hideOnKeyboard': _hideOnKeyboard,
+        'followRotation': _followRotation,
+        'iconSize': _iconSize,
+        'opacity': _opacity,
+        'showPosition': _showPosition,
+        'recentCount': _recentCount,
+        'orientation': _orientation,
+        'iconShape': _iconShape,
+      });
+      await _channel.invokeMethod('refreshDock');
     });
     if (key == 'hideOnLaunch' && value == true) {
-      final usageAccess =
-          await _channel.invokeMethod<bool>('hasUsageAccess') ?? false;
-      if (!usageAccess && mounted) {
-        await _channel.invokeMethod('openUsageAccessSettings');
+      await _checkUsageAccess();
+      if (!_usageAccess && mounted) {
+        await _openUsageAccessSettings();
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('外部起動の検知には使用状況へのアクセスを許可してください')),
         );
@@ -131,10 +238,14 @@ class _DockHomePageState extends State<DockHomePage>
     if (!allowed) {
       setState(() => _overlayEnabled = true);
       await _set('overlayEnabled', true);
-      await _channel.invokeMethod('openOverlaySettings');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('「他のアプリの上に表示」を許可してください')));
+      _showPermissionDialog(
+        title: '表示権限が必要です',
+        message: '他のアプリの上に dock を表示するため、表示権限を許可してください。',
+        actionLabel: '表示権限を設定',
+        action: () async {
+          await _channel.invokeMethod('openOverlaySettings');
+        },
+      );
       return;
     }
     setState(() => _overlayEnabled = value);
@@ -237,9 +348,12 @@ class _DockHomePageState extends State<DockHomePage>
                 trailing: DropdownButton<String>(
                   value: _iconShape,
                   items: const [
-                    DropdownMenuItem(value: 'circle', child: Text('まる')),
-                    DropdownMenuItem(value: 'square', child: Text('四角')),
-                    DropdownMenuItem(value: 'squircle', child: Text('スワークル')),
+                    DropdownMenuItem(value: 'round', child: Text('round')),
+                    DropdownMenuItem(
+                      value: 'squircle',
+                      child: Text('squircle'),
+                    ),
+                    DropdownMenuItem(value: 'square', child: Text('square')),
                   ],
                   onChanged: (v) {
                     if (v != null) {
@@ -272,6 +386,26 @@ class _DockHomePageState extends State<DockHomePage>
                   _set('hideOnLaunch', v);
                 },
               ),
+              _slider('表示ボタンの位置', _showPosition, 0, 100, (v) {
+                setState(() => _showPosition = v);
+                _set('showPosition', v);
+              }),
+              ListTile(
+                contentPadding: const EdgeInsets.only(left: 16),
+                title: const Text('外部アプリの起動検知'),
+                subtitle: Text(_usageAccess ? '許可済み' : '許可が必要です'),
+                trailing: const Icon(Icons.open_in_new_rounded),
+                onTap: _openUsageAccessSettings,
+              ),
+              ListTile(
+                contentPadding: const EdgeInsets.only(left: 16),
+                title: const Text('バッテリー最適化の除外'),
+                subtitle: Text(
+                  _batteryOptimizationExempt ? '許可済み' : 'タスクキル対策に許可を推奨',
+                ),
+                trailing: const Icon(Icons.battery_saver_rounded),
+                onTap: _openBatterySettings,
+              ),
               SwitchListTile(
                 contentPadding: const EdgeInsets.only(left: 16),
                 title: const Text('表示後に自動で隠す'),
@@ -279,6 +413,15 @@ class _DockHomePageState extends State<DockHomePage>
                 onChanged: (v) {
                   setState(() => _hideAfterDelay = v);
                   _set('hideAfterDelay', v);
+                },
+              ),
+              SwitchListTile(
+                contentPadding: const EdgeInsets.only(left: 16),
+                title: const Text('キーボード表示時に隠す'),
+                value: _hideOnKeyboard,
+                onChanged: (v) {
+                  setState(() => _hideOnKeyboard = v);
+                  _set('hideOnKeyboard', v);
                 },
               ),
               _slider('最近使ったアプリの数', _recentCount.toDouble(), 1, 8, (v) {

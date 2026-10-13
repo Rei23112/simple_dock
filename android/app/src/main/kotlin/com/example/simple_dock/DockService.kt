@@ -8,12 +8,12 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.ColorDrawable
 import android.os.*
 import android.provider.Settings
 import android.view.*
-import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import org.json.JSONArray
 
@@ -38,6 +38,7 @@ class DockService : Service() {
     private var drawerView: View? = null
     private var collapsedView: TextView? = null
     private val handler = Handler(Looper.getMainLooper())
+    private val hideRunnable = Runnable { collapse() }
     private var lastForegroundPackage: String? = null
     private var lastForegroundEventTime = 0L
     private var keyboardCollapsed = false
@@ -51,7 +52,10 @@ class DockService : Service() {
     private val settingsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                ACTION_SETTINGS_CHANGED -> showDock()
+                ACTION_SETTINGS_CHANGED -> {
+                    keyboardCollapsed = false
+                    showDock()
+                }
                 ACTION_COLLAPSE -> collapse()
             }
         }
@@ -66,6 +70,7 @@ class DockService : Service() {
         }
         registerReceiver(settingsReceiver, IntentFilter(ACTION_SETTINGS_CHANGED), RECEIVER_NOT_EXPORTED)
         ensureInitialRecent()
+        lastForegroundEventTime = System.currentTimeMillis()
         startForeground(NOTIFICATION_ID, Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Simple Dock")
             .setContentText("ドックを表示中")
@@ -81,6 +86,7 @@ class DockService : Service() {
     override fun onDestroy() {
         unregisterReceiver(settingsReceiver)
         handler.removeCallbacks(foregroundMonitor)
+        handler.removeCallbacks(hideRunnable)
         removeViews()
         super.onDestroy()
     }
@@ -90,11 +96,13 @@ class DockService : Service() {
     private fun prefs() = getSharedPreferences("dock", MODE_PRIVATE)
 
     private fun monitorForegroundApp() {
+        if (!hasUsageAccess()) return
         val usageStats = getSystemService(UsageStatsManager::class.java) ?: return
         val now = System.currentTimeMillis()
-        val events = usageStats.queryEvents(now - 10000, now)
+        val installedPackages = installedApps(this).mapNotNull { it["package"] }.toSet()
+        val events = usageStats.queryEvents(now - 3000, now)
         val event = UsageEvents.Event()
-        val foregroundPackages = mutableListOf<Pair<Long, String>>()
+        var latestForeground: Pair<Long, String>? = null
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
             val foregroundEvent = event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND ||
@@ -102,20 +110,33 @@ class DockService : Service() {
                     event.eventType == UsageEvents.Event.ACTIVITY_RESUMED)
             if (foregroundEvent &&
                 event.timeStamp > lastForegroundEventTime &&
-                event.packageName != packageName
+                event.packageName != packageName &&
+                installedPackages.contains(event.packageName)
             ) {
-                foregroundPackages.add(event.timeStamp to event.packageName)
+                if (latestForeground == null || event.timeStamp > latestForeground!!.first) {
+                    latestForeground = event.timeStamp to event.packageName
+                }
             }
         }
-        foregroundPackages.sortedBy { it.first }.forEach { (timeStamp, foregroundPackage) ->
-            lastForegroundEventTime = timeStamp
-            if (foregroundPackage == lastForegroundPackage) return@forEach
-            if (installedApps(this).any { it["package"] == foregroundPackage }) {
-                lastForegroundPackage = foregroundPackage
-                updateRecent(foregroundPackage)
-                if (prefs().getBoolean("hideOnLaunch", true)) collapse() else showDock()
-            }
+        val (timeStamp, foregroundPackage) = latestForeground ?: return
+        lastForegroundEventTime = timeStamp
+        if (foregroundPackage == lastForegroundPackage) return
+        lastForegroundPackage = foregroundPackage
+        updateRecent(foregroundPackage)
+        if (prefs().getBoolean("hideOnLaunch", true)) {
+            collapse()
+        } else {
+            showDock()
         }
+    }
+
+    private fun hasUsageAccess(): Boolean {
+        val appOps = getSystemService(AppOpsManager::class.java) ?: return false
+        return appOps.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            android.os.Process.myUid(),
+            packageName,
+        ) == AppOpsManager.MODE_ALLOWED
     }
 
     private fun updateRecent(packageName: String) {
@@ -126,7 +147,15 @@ class DockService : Service() {
     }
 
     private fun monitorKeyboard() {
-        val view = dockView ?: collapsedView ?: drawerView
+        if (!prefs().getBoolean("hideOnKeyboard", true)) return
+        val view = dockView ?: drawerView ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val imeVisible = view?.rootWindowInsets?.isVisible(WindowInsets.Type.ime())
+            if (imeVisible != null) {
+                setKeyboardVisibility(imeVisible)
+                return
+            }
+        }
         val visibleFrame = Rect()
         val visibleHeight = if (view != null) {
             view.getWindowVisibleDisplayFrame(visibleFrame)
@@ -134,9 +163,23 @@ class DockService : Service() {
         } else {
             0
         }
-        val inputMethod = getSystemService(InputMethodManager::class.java)
-        val keyboardVisible = visibleHeight > dp(160) || inputMethod?.isAcceptingText == true
-        if (keyboardVisible && !keyboardCollapsed) {
+        val keyboardVisible = visibleHeight > dp(160)
+        setKeyboardVisibility(keyboardVisible)
+    }
+
+    private fun observeKeyboardVisibility(view: View) {
+        view.viewTreeObserver.addOnGlobalLayoutListener {
+            if (!prefs().getBoolean("hideOnKeyboard", true)) return@addOnGlobalLayoutListener
+            val frame = Rect()
+            view.getWindowVisibleDisplayFrame(frame)
+            setKeyboardVisibility(
+                resources.displayMetrics.heightPixels - frame.bottom > dp(160),
+            )
+        }
+    }
+
+    private fun setKeyboardVisibility(keyboardVisible: Boolean) {
+        if (keyboardVisible && !keyboardCollapsed && (dockView != null || drawerView != null)) {
             keyboardCollapsed = true
             collapse()
         } else if (!keyboardVisible && keyboardCollapsed) {
@@ -188,6 +231,7 @@ class DockService : Service() {
 
     private fun showDock() {
         if (!Settings.canDrawOverlays(this)) return
+        handler.removeCallbacks(hideRunnable)
         removeViews()
         val vertical = prefs().getString("orientation", "bottom") != "bottom"
         val size = dp(prefs().getFloat("iconSize", 56f).toInt())
@@ -200,6 +244,13 @@ class DockService : Service() {
                 setColor(dockBackgroundColor())
             }
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            root.setOnApplyWindowInsetsListener { _, insets ->
+                setKeyboardVisibility(insets.isVisible(WindowInsets.Type.ime()))
+                insets
+            }
+        }
+        observeKeyboardVisibility(root)
         val pinned = orderedPackages("pinned_order").filterNot(hiddenPackages()::contains)
         val recent = orderedPackages("recent_order")
             .filterNot(hiddenPackages()::contains)
@@ -223,7 +274,7 @@ class DockService : Service() {
         val width = if (vertical) size + dp(36) else WindowManager.LayoutParams.WRAP_CONTENT
         val height = if (vertical) WindowManager.LayoutParams.WRAP_CONTENT else size + dp(36)
         windowManager.addView(root, params(width, height, gravity))
-        if (prefs().getBoolean("hideAfterDelay", false)) handler.postDelayed({ collapse() }, 6000)
+        if (prefs().getBoolean("hideAfterDelay", false)) handler.postDelayed(hideRunnable, 6000)
     }
 
     private fun addHideButton(root: LinearLayout, size: Int, vertical: Boolean) {
@@ -258,16 +309,34 @@ class DockService : Service() {
         val manager = packageManager
         val info = try { manager.getApplicationInfo(packageName, 0) } catch (_: Exception) { return }
         val label = manager.getApplicationLabel(info).toString()
+        val iconShape = prefs().getString("iconShape", "round") ?: "round"
+        val cornerRadius = when (iconShape) {
+            "square" -> dp(4).toFloat()
+            "squircle" -> size * .22f
+            else -> size * .35f
+        }
         val button = ImageButton(this).apply {
             setImageDrawable(manager.getApplicationIcon(info))
-            setPadding(size / 6, size / 6, size / 6, size / 6)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(size / 8, size / 8, size / 8, size / 8)
             background = GradientDrawable().apply {
-                shape = if (prefs().getString("iconShape", "circle") == "circle") GradientDrawable.OVAL else GradientDrawable.RECTANGLE
-                cornerRadius = when (prefs().getString("iconShape", "circle")) {
-                    "square" -> 4f
-                    else -> size * .35f
+                shape = if (iconShape == "round" || iconShape == "circle") {
+                    GradientDrawable.OVAL
+                } else {
+                    GradientDrawable.RECTANGLE
                 }
-                setColor(prefs().getInt("accent", Color.rgb(240, 93, 94)))
+                this.cornerRadius = cornerRadius
+                setColor(Color.TRANSPARENT)
+            }
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: android.graphics.Outline) {
+                    if (iconShape == "round" || iconShape == "circle") {
+                        outline.setOval(0, 0, size, size)
+                    } else {
+                        outline.setRoundRect(0, 0, size, size, cornerRadius)
+                    }
+                }
             }
             contentDescription = label
             setOnClickListener { launch(packageName) }
@@ -429,10 +498,10 @@ class DockService : Service() {
         val drawerWidth = if (orientation == "bottom") {
             dp(460).coerceAtMost(screenWidth - dp(24)).coerceAtLeast(dp(1))
         } else {
-            dp(460).coerceAtMost(screenWidth - dockThickness - dp(24)).coerceAtLeast(dp(1))
+            dp(460).coerceAtMost(screenWidth - dockThickness - dp(52)).coerceAtLeast(dp(1))
         }
         val drawerHeight = if (orientation == "bottom") {
-            dp(720).coerceAtMost(screenHeight - dockThickness - dp(24)).coerceAtLeast(dp(1))
+            dp(720).coerceAtMost(screenHeight - dockThickness - dp(52)).coerceAtLeast(dp(1))
         } else {
             dp(720).coerceAtMost(screenHeight - dp(24)).coerceAtLeast(dp(1))
         }
@@ -451,8 +520,8 @@ class DockService : Service() {
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = drawerGravity
-            x = if (orientation == "bottom") 0 else dockThickness + dp(24)
-            y = if (orientation == "bottom") dockThickness + dp(24) else 0
+            x = if (orientation == "bottom") 0 else dockThickness + dp(52)
+            y = if (orientation == "bottom") dockThickness + dp(52) else 0
         }
         windowManager.addView(panel, drawerParams)
     }
@@ -514,8 +583,22 @@ class DockService : Service() {
         closeDrawer(false)
         updateRecent(packageName)
         packageManager.getLaunchIntentForPackage(packageName)?.let {
-            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(it)
+            it.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED,
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val options = ActivityOptions.makeBasic().apply {
+                    runCatching {
+                        javaClass.getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+                            .invoke(this, 1)
+                    }
+                }
+                startActivity(it, options.toBundle())
+            } else {
+                startActivity(it)
+            }
         }
         if (prefs().getBoolean("hideOnLaunch", true)) collapse() else showDock()
     }
@@ -550,18 +633,20 @@ class DockService : Service() {
     }
 
     private fun collapse() {
+        handler.removeCallbacks(hideRunnable)
         removeViews()
         val orientation = prefs().getString("orientation", "bottom") ?: "bottom"
         val vertical = orientation != "bottom"
         val iconSize = dp(prefs().getFloat("iconSize", 56f).toInt())
-        val arrowButtonSize = dp(32)
+        val arrowButtonSize = dp(30)
         val arrow = TextView(this).apply {
             text = when (prefs().getString("orientation", "bottom")) {
                 "left" -> "▶"
                 "right" -> "◀"
                 else -> "▲"
             }
-            textSize = 16f
+            textSize = 12f
+            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply {
@@ -581,8 +666,8 @@ class DockService : Service() {
             setOnClickListener { showDock() }
         }
         collapsedView = arrow
-        val width = if (vertical) arrowButtonSize else iconSize
-        val height = if (vertical) iconSize else arrowButtonSize
+        val width = if (vertical) arrowButtonSize else iconSize + dp(16)
+        val height = if (vertical) iconSize + dp(16) else arrowButtonSize
         val maxX = (resources.displayMetrics.widthPixels - width).coerceAtLeast(0)
         val maxY = (resources.displayMetrics.heightPixels - height).coerceAtLeast(0)
         val collapsedGravity = when (orientation) {
@@ -591,57 +676,20 @@ class DockService : Service() {
             else -> Gravity.BOTTOM or Gravity.START
         }
         val collapsedParams = params(width, height, collapsedGravity).apply {
+            flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
             x = if (orientation == "bottom") {
-                prefs().getInt("collapsedX", dp(20)).coerceIn(0, maxX)
+                (maxX * prefs().getFloat("showPosition", 50f) / 100f).toInt()
+                    .coerceIn(0, maxX)
             } else {
                 0
             }
             y = if (orientation == "bottom") {
                 0
             } else {
-                prefs().getInt("collapsedY", dp(120)).coerceIn(0, maxY)
+                (maxY * prefs().getFloat("showPosition", 50f) / 100f).toInt()
+                    .coerceIn(0, maxY)
             }
         }
-        arrow.setOnTouchListener(object : View.OnTouchListener {
-            var downX = 0f
-            var downY = 0f
-            var startX = 0
-            var startY = 0
-            var moved = false
-
-            override fun onTouch(view: View, event: MotionEvent): Boolean {
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> {
-                        downX = event.rawX
-                        downY = event.rawY
-                        startX = collapsedParams.x
-                        startY = collapsedParams.y
-                        moved = false
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val dx = (event.rawX - downX).toInt()
-                        val dy = (event.rawY - downY).toInt()
-                        moved = moved || kotlin.math.abs(dx) > dp(4) || kotlin.math.abs(dy) > dp(4)
-                        if (moved) {
-                            if (orientation == "bottom") {
-                                collapsedParams.x = (startX + dx).coerceIn(0, maxX)
-                                collapsedParams.y = 0
-                            } else {
-                                collapsedParams.x = 0
-                                collapsedParams.y = (startY + dy).coerceIn(0, maxY)
-                            }
-                            windowManager.updateViewLayout(view, collapsedParams)
-                        }
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        if (moved) {
-                            prefs().edit().putInt("collapsedX", collapsedParams.x).putInt("collapsedY", collapsedParams.y).apply()
-                        } else view.performClick()
-                    }
-                }
-                return true
-            }
-        })
         windowManager.addView(arrow, collapsedParams)
     }
 

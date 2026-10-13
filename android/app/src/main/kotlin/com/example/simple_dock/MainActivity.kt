@@ -3,6 +3,7 @@ package com.example.simple_dock
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -28,6 +29,15 @@ class MainActivity : FlutterActivity() {
 				"hasUsageAccess" -> result.success(hasUsageAccess())
 				"openUsageAccessSettings" -> {
 					startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+					result.success(null)
+				}
+				"hasBatteryOptimizationExemption" -> result.success(hasBatteryOptimizationExemption())
+				"openBatterySettings" -> {
+					val intent = Intent(
+						Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+						Uri.parse("package:$packageName"),
+					)
+					startActivity(intent)
 					result.success(null)
 				}
 				"refreshDock" -> {
@@ -81,6 +91,11 @@ class MainActivity : FlutterActivity() {
 						}
 					}
 					settings.apply()
+					val prefs = getSharedPreferences("dock", MODE_PRIVATE)
+					if (prefs.getBoolean("overlayEnabled", false) && Settings.canDrawOverlays(this)) {
+						val intent = Intent(this, DockService::class.java)
+						if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+					}
 					sendBroadcast(Intent(DockService.ACTION_SETTINGS_CHANGED))
 					result.success(null)
 				}
@@ -96,5 +111,10 @@ class MainActivity : FlutterActivity() {
 			android.os.Process.myUid(),
 			packageName,
 		) == android.app.AppOpsManager.MODE_ALLOWED
+	}
+
+	private fun hasBatteryOptimizationExemption(): Boolean {
+		val powerManager = getSystemService(PowerManager::class.java)
+		return powerManager?.isIgnoringBatteryOptimizations(packageName) == true
 	}
 }
